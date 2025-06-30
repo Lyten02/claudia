@@ -220,49 +220,32 @@ fn extract_first_user_message(jsonl_path: &PathBuf) -> (Option<String>, Option<S
     (None, None)
 }
 
-/// Helper function to create a tokio Command with proper environment variables
-/// This ensures commands like Claude can find Node.js and other dependencies
-fn create_command_with_env(program: &str) -> Command {
-    // Convert std::process::Command to tokio::process::Command
-    let _std_cmd = crate::claude_binary::create_command_with_env(program);
-
-    // Create a new tokio Command from the program path
-    let mut tokio_cmd = Command::new(program);
-
-    // Copy over all environment variables
-    for (key, value) in std::env::vars() {
-        if key == "PATH"
-            || key == "HOME"
-            || key == "USER"
-            || key == "SHELL"
-            || key == "LANG"
-            || key == "LC_ALL"
-            || key.starts_with("LC_")
-            || key == "NODE_PATH"
-            || key == "NVM_DIR"
-            || key == "NVM_BIN"
-            || key == "HOMEBREW_PREFIX"
-            || key == "HOMEBREW_CELLAR"
-        {
-            log::debug!("Inheriting env var: {}={}", key, value);
-            tokio_cmd.env(&key, &value);
+/// Helper function to create a command for Claude binary
+fn create_claude_command(claude_path: &str) -> Command {
+    let mut cmd = Command::new(claude_path);
+    
+    // Add PATH environment variable with Node.js locations
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let node_paths = vec![
+        "/opt/homebrew/opt/node@18/bin",
+        "/opt/homebrew/opt/node@20/bin", 
+        "/opt/homebrew/opt/node@22/bin",
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ];
+    
+    let mut extended_path = current_path.clone();
+    for path in &node_paths {
+        if !current_path.contains(path) && std::path::Path::new(path).exists() {
+            extended_path = format!("{}:{}", path, extended_path);
         }
     }
-
-    // Add NVM support if the program is in an NVM directory
-    if program.contains("/.nvm/versions/node/") {
-        if let Some(node_bin_dir) = std::path::Path::new(program).parent() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let node_bin_str = node_bin_dir.to_string_lossy();
-            if !current_path.contains(&node_bin_str.as_ref()) {
-                let new_path = format!("{}:{}", node_bin_str, current_path);
-                tokio_cmd.env("PATH", new_path);
-            }
-        }
-    }
-
-    tokio_cmd
+    
+    cmd.env("PATH", extended_path);
+    log::info!("Creating Claude command: {}", claude_path);
+    cmd
 }
+
 
 /// Lists all projects in the ~/.claude/projects directory
 #[tauri::command]
@@ -799,6 +782,49 @@ pub async fn execute_claude_code(
         model
     );
 
+    // First, verify that Node.js is accessible
+    // Check if we can find node directly
+    let node_locations = vec![
+        "/opt/homebrew/opt/node@18/bin/node",
+        "/opt/homebrew/bin/node", 
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ];
+    
+    let node_path = node_locations.into_iter()
+        .find(|path| std::path::Path::new(path).exists());
+        
+    match node_path {
+        Some(path) => {
+            log::info!("Found node binary at: {}", path);
+            
+            // Test if it works
+            let node_test = Command::new(path)
+                .arg("--version")
+                .output()
+                .await;
+                
+            match node_test {
+                Ok(output) if output.status.success() => {
+                    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    log::info!("Node.js version: {}", version);
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::error!("Node.js test failed: {}", stderr);
+                }
+                Err(e) => {
+                    log::error!("Failed to run node: {}", e);
+                }
+            }
+        }
+        None => {
+            log::error!("Node.js not found in any common location");
+            let _ = app.emit("claude-error", "Node.js not found in common locations: /opt/homebrew/opt/node@18/bin/node, /opt/homebrew/bin/node, /usr/local/bin/node, /usr/bin/node");
+            return Err("Node.js not found. Please ensure Node.js is installed.".to_string());
+        }
+    }
+
     // Check if sandboxing should be used
     let use_sandbox = should_use_sandbox(&app)?;
 
@@ -806,7 +832,7 @@ pub async fn execute_claude_code(
         create_sandboxed_claude_command(&app, &project_path)?
     } else {
         let claude_path = find_claude_binary(&app)?;
-        create_command_with_env(&claude_path)
+        create_claude_command(&claude_path)
     };
 
     cmd.arg("-p")
@@ -845,7 +871,7 @@ pub async fn continue_claude_code(
         create_sandboxed_claude_command(&app, &project_path)?
     } else {
         let claude_path = find_claude_binary(&app)?;
-        create_command_with_env(&claude_path)
+        create_claude_command(&claude_path)
     };
 
     cmd.arg("-c") // Continue flag
@@ -887,9 +913,13 @@ pub async fn resume_claude_code(
         create_sandboxed_claude_command(&app, &project_path)?
     } else {
         let claude_path = find_claude_binary(&app)?;
-        create_command_with_env(&claude_path)
+        create_claude_command(&claude_path)
     };
 
+    // Log the full command for debugging
+    log::info!("Executing Claude resume command with session_id: {}, model: {}, in directory: {}", 
+        &session_id, &model, &project_path);
+    
     cmd.arg("--resume")
         .arg(&session_id)
         .arg("-p")
@@ -1104,13 +1134,13 @@ fn create_sandboxed_claude_command(app: &AppHandle, project_path: &str) -> Resul
                                 log::warn!(
                                     "Sandboxing not supported on Windows, using regular command"
                                 );
-                                Ok(create_command_with_env(&claude_path))
+                                Ok(create_claude_command(&claude_path))
                             }
                         }
                         Err(e) => {
                             log::error!("Failed to build sandbox profile: {}, falling back to non-sandboxed", e);
                             let claude_path = find_claude_binary(app)?;
-                            Ok(create_command_with_env(&claude_path))
+                            Ok(create_claude_command(&claude_path))
                         }
                     }
                 }
@@ -1120,14 +1150,14 @@ fn create_sandboxed_claude_command(app: &AppHandle, project_path: &str) -> Resul
                         e
                     );
                     let claude_path = find_claude_binary(app)?;
-                    Ok(create_command_with_env(&claude_path))
+                    Ok(create_claude_command(&claude_path))
                 }
             }
         }
         None => {
             log::info!("No default active sandbox profile found: proceeding without sandbox");
             let claude_path = find_claude_binary(app)?;
-            Ok(create_command_with_env(&claude_path))
+            Ok(create_claude_command(&claude_path))
         }
     }
 }
@@ -1164,10 +1194,20 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command) -> Result<(), St
         uuid::Uuid::new_v4().to_string()
     );
 
+    // Log the command we're about to execute for debugging
+    log::info!("About to spawn Claude process");
+    log::info!("Session ID: {}", session_id);
+    
     // Spawn the process
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn Claude: {}", e))?;
+        .map_err(|e| {
+            log::error!("Failed to spawn Claude process: {}", e);
+            log::error!("Error details: {:?}", e);
+            let _ = app.emit("claude-error", format!("Failed to start Claude: {}", e));
+            let _ = app.emit("claude-output", r#"{"type":"system","subtype":"error","error":"Failed to spawn Claude process"}"#);
+            format!("Failed to spawn Claude: {}", e)
+        })?;
 
     // Get stdout and stderr
     let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
@@ -1180,6 +1220,12 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command) -> Result<(), St
         pid,
         session_id
     );
+    
+    // Emit initial status
+    let _ = app.emit("claude-output", format!(r#"{{"type":"system","subtype":"spawn","pid":{:?},"session_id":"{}"}}"#, pid, session_id));
+    
+    // Add a small delay to ensure process has started
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Create readers
     let stdout_reader = BufReader::new(stdout);
@@ -1202,13 +1248,19 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command) -> Result<(), St
     let session_id_clone = session_id.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = stdout_reader.lines();
+        let mut line_count = 0;
+        log::info!("Starting to read stdout from Claude process");
+        
         while let Ok(Some(line)) = lines.next_line().await {
-            log::debug!("Claude stdout: {}", line);
+            line_count += 1;
+            log::info!("Claude stdout line {}: {}", line_count, line);
             // Emit the line to the frontend with session isolation
             let _ = app_handle.emit(&format!("claude-output:{}", session_id_clone), &line);
             // Also emit to the generic event for backward compatibility
             let _ = app_handle.emit("claude-output", &line);
         }
+        
+        log::info!("Finished reading stdout, total lines: {}", line_count);
     });
 
     let app_handle_stderr = app.clone();
@@ -1217,10 +1269,20 @@ async fn spawn_claude_process(app: AppHandle, mut cmd: Command) -> Result<(), St
         let mut lines = stderr_reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
             log::error!("Claude stderr: {}", line);
-            // Emit error lines to the frontend with session isolation
-            let _ = app_handle_stderr.emit(&format!("claude-error:{}", session_id_clone2), &line);
-            // Also emit to the generic event for backward compatibility
-            let _ = app_handle_stderr.emit("claude-error", &line);
+            
+            // Check if this is the specific env error we're trying to fix
+            if line.contains("env: node: No such file or directory") {
+                log::error!("CRITICAL: Claude cannot find node! This should not happen with our direct node execution.");
+                // Emit as output so user can see it in the chat
+                let error_msg = r#"{"type":"system","subtype":"error","error":"env: node: No such file or directory - This indicates Claude is still using env shebang instead of our direct node execution"}"#;
+                let _ = app_handle_stderr.emit(&format!("claude-output:{}", session_id_clone2), error_msg);
+                let _ = app_handle_stderr.emit("claude-output", error_msg);
+            } else {
+                // Emit error lines to the frontend with session isolation
+                let _ = app_handle_stderr.emit(&format!("claude-error:{}", session_id_clone2), &line);
+                // Also emit to the generic event for backward compatibility
+                let _ = app_handle_stderr.emit("claude-error", &line);
+            }
         }
     });
 

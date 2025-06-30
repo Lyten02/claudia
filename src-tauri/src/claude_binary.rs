@@ -146,7 +146,11 @@ fn discover_all_installations() -> Vec<ClaudeInstallation> {
 fn try_which_command() -> Option<ClaudeInstallation> {
     debug!("Trying 'which claude' to find binary...");
 
-    match Command::new("which").arg("claude").output() {
+    // Use create_command_with_env to ensure we have the extended PATH
+    let mut cmd = create_command_with_env("which");
+    cmd.arg("claude");
+    
+    match cmd.output() {
         Ok(output) if output.status.success() => {
             let output_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
@@ -444,6 +448,70 @@ pub fn create_command_with_env(program: &str) -> Command {
                 cmd.env("PATH", new_path);
             }
         }
+    }
+
+    // Add common Node.js installation paths to PATH
+    let current_path = cmd
+        .get_envs()
+        .find(|(k, _)| k.to_str() == Some("PATH"))
+        .and_then(|(_, v)| v)
+        .and_then(|v| v.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+
+    let mut additional_paths = Vec::new();
+    
+    // Common Node.js installation locations
+    additional_paths.push("/usr/local/bin".to_string());
+    additional_paths.push("/opt/homebrew/bin".to_string());
+    additional_paths.push("/opt/homebrew/opt/node@18/bin".to_string());
+    additional_paths.push("/opt/homebrew/opt/node@20/bin".to_string());
+    additional_paths.push("/opt/homebrew/opt/node@22/bin".to_string());
+    
+    if let Ok(home) = std::env::var("HOME") {
+        // Check for NVM installations
+        let nvm_base = format!("{}/.nvm/versions/node", home);
+        if let Ok(entries) = std::fs::read_dir(&nvm_base) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let bin_path = entry.path().join("bin");
+                    if bin_path.exists() {
+                        additional_paths.push(bin_path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        
+        additional_paths.push(format!("{}/.local/bin", home));
+        additional_paths.push(format!("{}/.npm-global/bin", home));
+        additional_paths.push(format!("{}/.yarn/bin", home));
+    }
+    
+    // Build the extended PATH
+    let mut extended_path = current_path.clone();
+    debug!("Current PATH: {}", current_path);
+    debug!("Additional paths to add: {:?}", additional_paths);
+    
+    for path in additional_paths {
+        if !current_path.contains(&path) {
+            // Check if path exists and log the result
+            let exists = std::path::Path::new(&path).exists();
+            if exists {
+                debug!("Adding existing path to PATH: {}", path);
+                extended_path = format!("{}:{}", path, extended_path);
+            } else {
+                debug!("Path does not exist, skipping: {}", path);
+            }
+        } else {
+            debug!("Path already in PATH: {}", path);
+        }
+    }
+    
+    if extended_path != current_path {
+        debug!("Extended PATH for Node.js discovery: {}", extended_path);
+        cmd.env("PATH", extended_path);
+    } else {
+        debug!("PATH was not extended");
     }
 
     cmd

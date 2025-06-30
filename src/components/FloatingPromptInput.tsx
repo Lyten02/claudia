@@ -347,6 +347,12 @@ const FloatingPromptInputInner = (
       onSend(finalPrompt, selectedModel);
       setPrompt("");
       setEmbeddedImages([]);
+      
+      // Restore focus to the appropriate textarea after sending
+      setTimeout(() => {
+        const targetTextarea = isExpanded ? expandedTextareaRef.current : textareaRef.current;
+        targetTextarea?.focus();
+      }, 100);
     }
   };
 

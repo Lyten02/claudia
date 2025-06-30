@@ -285,10 +285,11 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       // Set up event listeners before executing
       console.log('[ClaudeCodeSession] Setting up event listeners...');
       
-      // If we already have a Claude session ID, use isolated listeners
-      const eventSuffix = claudeSessionId ? `:${claudeSessionId}` : '';
+      // We'll store the session ID we receive and use it for future listeners
+      let currentSessionId = claudeSessionId;
       
-      const outputUnlisten = await listen<string>(`claude-output${eventSuffix}`, async (event) => {
+      // Handler function to avoid duplication
+      const handleOutput = async (event: { payload: string }) => {
         try {
           console.log('[ClaudeCodeSession] Received claude-output:', event.payload);
           
@@ -311,8 +312,10 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
             const projectId = projectPath.replace(/[^a-zA-Z0-9]/g, '-');
             
             // Set both claudeSessionId and extractedSessionInfo
-            if (!claudeSessionId) {
+            if (!claudeSessionId && !currentSessionId) {
+              currentSessionId = message.session_id;
               setClaudeSessionId(message.session_id);
+              console.log('[ClaudeCodeSession] Setting claudeSessionId:', message.session_id);
             }
             
             if (!extractedSessionInfo) {
@@ -325,14 +328,14 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
         } catch (err) {
           console.error("Failed to parse message:", err, event.payload);
         }
-      });
+      };
 
-      const errorUnlisten = await listen<string>(`claude-error${eventSuffix}`, (event) => {
+      const handleError = (event: { payload: string }) => {
         console.error("Claude error:", event.payload);
         setError(event.payload);
-      });
+      };
 
-      const completeUnlisten = await listen<boolean>(`claude-complete${eventSuffix}`, async (event) => {
+      const handleComplete = async (event: { payload: boolean }) => {
         console.log('[ClaudeCodeSession] Received claude-complete:', event.payload);
         setIsLoading(false);
         hasActiveSessionRef.current = false;
@@ -360,9 +363,24 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
             console.error('Failed to check auto checkpoint:', err);
           }
         }
-      });
+      };
 
-      unlistenRefs.current = [outputUnlisten, errorUnlisten, completeUnlisten];
+      // Listen to both generic and session-specific events
+      const listeners: UnlistenFn[] = [];
+      
+      // Always listen to generic events
+      listeners.push(await listen<string>('claude-output', handleOutput));
+      listeners.push(await listen<string>('claude-error', handleError));
+      listeners.push(await listen<boolean>('claude-complete', handleComplete));
+      
+      // If we have a session ID, also listen to session-specific events
+      if (currentSessionId) {
+        listeners.push(await listen<string>(`claude-output:${currentSessionId}`, handleOutput));
+        listeners.push(await listen<string>(`claude-error:${currentSessionId}`, handleError));
+        listeners.push(await listen<boolean>(`claude-complete:${currentSessionId}`, handleComplete));
+      }
+      
+      unlistenRefs.current = listeners;
       
       // Add the user message immediately to the UI (after setting up listeners)
       const userMessage: ClaudeStreamMessage = {
@@ -379,9 +397,10 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       setMessages(prev => [...prev, userMessage]);
 
       // Execute the appropriate command
-      if (effectiveSession && !isFirstPrompt) {
-        console.log('[ClaudeCodeSession] Resuming session:', effectiveSession.id);
-        await api.resumeClaudeCode(projectPath, effectiveSession.id, prompt, model);
+      // For subsequent messages in the same project, use continue instead of resume
+      if (claudeSessionId || (effectiveSession && !isFirstPrompt)) {
+        console.log('[ClaudeCodeSession] Continuing conversation in project:', projectPath);
+        await api.continueClaudeCode(projectPath, prompt, model);
       } else {
         console.log('[ClaudeCodeSession] Starting new session');
         setIsFirstPrompt(false);
