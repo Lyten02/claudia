@@ -4,12 +4,12 @@ import {
   ArrowLeft,
   Terminal,
   Loader2,
-  FolderOpen,
   Copy,
   ChevronDown,
   GitBranch,
   Settings,
-  Globe
+  Globe,
+  RefreshCw
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -31,6 +31,8 @@ import { SplitPane } from "@/components/ui/split-pane";
 import { WebviewPreview } from "./WebviewPreview";
 import type { ClaudeStreamMessage } from "./AgentExecution";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { ProjectPathSelector } from "./ProjectPathSelector";
+import { saveProjectToHistory, getMostRecentProject } from "@/lib/project-history";
 
 interface ClaudeCodeSessionProps {
   /**
@@ -63,7 +65,10 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
   onBack,
   className,
 }) => {
-  const [projectPath, setProjectPath] = useState(initialProjectPath || session?.project_path || "");
+  const [projectPath, setProjectPath] = useState(() => {
+    // Priority: session path > initial path > most recent project > empty
+    return session?.project_path || initialProjectPath || getMostRecentProject() || "";
+  });
   const [messages, setMessages] = useState<ClaudeStreamMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -80,6 +85,7 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
   const [forkCheckpointId, setForkCheckpointId] = useState<string | null>(null);
   const [forkSessionName, setForkSessionName] = useState("");
   const [isCancelling, setIsCancelling] = useState(false);
+  const [showRestartDialog, setShowRestartDialog] = useState(false);
   
   // New state for preview feature
   const [showPreview, setShowPreview] = useState(false);
@@ -273,6 +279,11 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       return;
     }
 
+    // Save project path to history when sending first message
+    if (!session) {
+      saveProjectToHistory(projectPath);
+    }
+
     try {
       setIsLoading(true);
       setError(null);
@@ -296,8 +307,14 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           // Store raw JSONL
           setRawJsonlOutput(prev => [...prev, event.payload]);
           
+          // Fix Rust's Some(...) notation before parsing
+          let cleanedPayload = event.payload;
+          if (cleanedPayload.includes('Some(')) {
+            cleanedPayload = cleanedPayload.replace(/Some\((\d+)\)/g, '$1');
+          }
+          
           // Parse and display
-          const message = JSON.parse(event.payload) as ClaudeStreamMessage;
+          const message = JSON.parse(cleanedPayload) as ClaudeStreamMessage;
           console.log('[ClaudeCodeSession] Parsed message:', message);
           
           setMessages(prev => {
@@ -610,6 +627,38 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
     }
   };
 
+  const handleRestartSession = async () => {
+    // Clean up current session
+    unlistenRefs.current.forEach(unlisten => unlisten());
+    unlistenRefs.current = [];
+    
+    // Reset all session-related state
+    setMessages([]);
+    setRawJsonlOutput([]);
+    setClaudeSessionId(null);
+    setExtractedSessionInfo(null);
+    setIsFirstPrompt(true);
+    setTotalTokens(0);
+    setError(null);
+    setIsLoading(false);
+    hasActiveSessionRef.current = false;
+    
+    // Clear checkpoint manager if there was a session
+    if (effectiveSession) {
+      try {
+        await api.clearCheckpointManager(effectiveSession.id);
+      } catch (err) {
+        console.error("Failed to clear checkpoint manager:", err);
+      }
+    }
+    
+    // Close the dialog
+    setShowRestartDialog(false);
+    
+    // Optionally, you could show a toast or notification here
+    console.log("Session restarted successfully");
+  };
+
   // Clean up listeners on component unmount
   useEffect(() => {
     return () => {
@@ -700,23 +749,13 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
       <Label htmlFor="project-path" className="text-sm font-medium">
         Project Directory
       </Label>
-      <div className="flex items-center gap-2 mt-1">
-        <Input
-          id="project-path"
+      <div className="mt-1">
+        <ProjectPathSelector
           value={projectPath}
-          onChange={(e) => setProjectPath(e.target.value)}
-          placeholder="/path/to/your/project"
-          className="flex-1"
+          onChange={setProjectPath}
+          onSelectPath={handleSelectPath}
           disabled={isLoading}
         />
-        <Button
-          onClick={handleSelectPath}
-          size="icon"
-          variant="outline"
-          disabled={isLoading}
-        >
-          <FolderOpen className="h-4 w-4" />
-        </Button>
       </div>
     </motion.div>
   );
@@ -778,6 +817,27 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           </div>
           
           <div className="flex items-center gap-2">
+            {/* Restart Session Button */}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowRestartDialog(true)}
+                    disabled={isLoading}
+                    className="flex items-center gap-2"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                    New Session
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  Start a new chat session in the current project
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+            
             {effectiveSession && (
               <>
                 <Button
@@ -1004,6 +1064,40 @@ export const ClaudeCodeSession: React.FC<ClaudeCodeSessionProps> = ({
           </DialogContent>
         </Dialog>
       )}
+
+      {/* Restart Session Dialog */}
+      <Dialog open={showRestartDialog} onOpenChange={setShowRestartDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Start New Session?</DialogTitle>
+            <DialogDescription>
+              This will clear the current chat history and start a fresh session in the same project directory.
+              {messages.length > 0 && (
+                <span className="block mt-2 text-destructive">
+                  Warning: Your current {messages.length} message{messages.length !== 1 ? 's' : ''} will be cleared.
+                </span>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setShowRestartDialog(false)}
+              disabled={isLoading}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleRestartSession}
+              disabled={isLoading}
+              variant="destructive"
+            >
+              Start New Session
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
